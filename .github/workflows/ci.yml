@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ACTIONLINT_VERSION: 1.7.12
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install actionlint
+        run: |
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLO "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}"
+          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum -c -
+          tar -xzf "$archive" actionlint
+          rm "$archive"
+      # actionlint also runs shellcheck on the run: blocks in workflows.
+      - name: Lint workflows
+        run: ./actionlint -color
+      # actionlint doesn't lint action.yml, so check its inline bash directly.
+      - name: Shellcheck the action's inline bash
+        run: |
+          steps="$(yq '.runs.steps | length' action.yml)"
+          for ((i = 0; i < steps; i++)); do
+            if [ "$(yq ".runs.steps[$i] | has(\"run\")" action.yml)" = "true" ]; then
+              echo "Checking step $i: $(yq ".runs.steps[$i].name" action.yml)"
+              yq ".runs.steps[$i].run" action.yml | shellcheck --shell=bash -
+            fi
+          done
+
+  # Runs the action from this checkout with an empty token. It stops at the
+  # token check, so it never reaches Docker, the Backproof API or any storage.
+  self-test:
+    name: Self-test (empty token)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run the action with an empty token
+        id: empty-token
+        continue-on-error: true
+        uses: ./
+        with:
+          token: ""
+      - name: Check the action failed
+        env:
+          OUTCOME: ${{ steps.empty-token.outcome }}
+        run: |
+          if [ "$OUTCOME" != "failure" ]; then
+            echo "::error::Expected the action to fail with an empty token, but its outcome was '$OUTCOME'."
+            exit 1
+          fi
+
+  # The exit code and error message are only in the job log, which can be
+  # read once the self-test job has finished.
+  self-test-log:
+    name: Self-test log
+    needs: self-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    steps:
+      - name: Check the exit code and the token error
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          JOB_NAME: Self-test (empty token)
+        run: |
+          job_id="$(gh api "repos/$REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs" \
+            --jq ".jobs[] | select(.name == \"$JOB_NAME\") | .id")"
+          if [ -z "$job_id" ]; then
+            echo "::error::Couldn't find the job '$JOB_NAME' in this run."
+            exit 1
+          fi
+
+          # Logs can take a few seconds to become available after a job ends.
+          for attempt in 1 2 3 4 5 6; do
+            if gh api "repos/$REPO/actions/jobs/$job_id/logs" > job.log 2>/dev/null && [ -s job.log ]; then
+              break
+            fi
+            echo "Log not available yet (attempt $attempt), retrying."
+            sleep 10
+          done
+
+          failed=0
+          for expected in \
+            "##[error]The token input is empty." \
+            "##[error]Process completed with exit code 2."; do
+            if grep -qF -- "$expected" job.log; then
+              echo "Found: $expected"
+            else
+              echo "::error::The self-test log doesn't contain: $expected"
+              failed=1
+            fi
+          done
+          exit "$failed"
