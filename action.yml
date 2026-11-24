@@ -1,0 +1,45 @@
+name: Backproof Runner
+description: Prove that your latest Postgres backup restores, in a throwaway container on this runner.
+author: Backproof
+branding:
+  icon: database
+  color: green
+
+inputs:
+  token:
+    description: CI token from the Add runner page in the Backproof dashboard. Store it as a repository secret.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Run due backup tests
+      shell: bash
+      env:
+        BACKPROOF_TOKEN: ${{ inputs.token }}
+      run: |
+        if [ "$RUNNER_OS" != "Linux" ]; then
+          echo "::error::The Backproof runner needs a Linux runner with Docker. Use runs-on: ubuntu-latest."
+          exit 2
+        fi
+
+        if [ -z "${BACKPROOF_TOKEN:-}" ]; then
+          echo "::error::The token input is empty. Create a CI token on the Add runner page and save it as the repository secret BACKPROOF_TOKEN."
+          exit 2
+        fi
+
+        if ! docker info >/dev/null 2>&1; then
+          echo "::error::Docker isn't available on this runner. Use runs-on: ubuntu-latest, or start Docker before this step."
+          exit 2
+        fi
+
+        # Passing only the names keeps secret values out of the command line.
+        forward=()
+        while IFS= read -r name; do
+          forward+=(--env "$name")
+        done < <(compgen -e | grep -E '^(BACKPROOF|BP_SRC)_' || true)
+
+        docker run --rm --pull always \
+          --volume /var/run/docker.sock:/var/run/docker.sock \
+          "${forward[@]}" \
+          backproofhq/runner:latest run --once
